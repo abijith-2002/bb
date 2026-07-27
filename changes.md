@@ -93,22 +93,69 @@ if-gt v0, v1, :cond_2
 
 ---
 
-## Data Flow (After All Patches)
+---
+
+## Patch v3 (2026-07-27) — Force walletEnabled = true
+
+### Problem
+Even with minBalance and minBalanceAvailable patched, buying still failed with `CheckoutException.DisabledWallet`. The server sends a **separate** `walletEnable` boolean that's checked in `g.java` (Kwik24 wallet handler) *before* it calls the checkout logic:
+
+```java
+// g.java (Kwik24 wallet handler):
+public final void b(double d2, h hVar) {
+    if (this.f6191d) {          // walletEnabled — server sends false when balance < 30
+        super.b(d2, hVar);      // proceed to checkout (where our v2 patches work)
+    } else {
+        hVar.f(new CheckoutException.DisabledWallet());  // ← was failing here
+    }
+}
+```
+
+`f6191d` is set from `paymentEntity.isWalletEnable()` in `PaymentManager.smali`.
+
+### 5. `com/bigbasket/bbinstant/core/payments/newiml/PaymentManager.smali`
+
+#### 5a. Force `isWalletEnable()` result to true (line ~1415)
+- **Original:** `invoke-virtual/range {p1 .. p1}, ...->isWalletEnable()Z` → `move-result v6` → `iput-boolean v6, v5, ...g;->d:Z`
+- **Patched:** Added `const/4 v6, 0x1` after `move-result v6` (overrides to true)
+- **Effect:** `g.f6191d` (walletEnabled) is always true → checkout proceeds to `super.b()` instead of throwing `DisabledWallet`
+
+### Smali Patch Detail (v3):
+```smali
+# Before:
+invoke-virtual/range {p1 .. p1}, Lcom/bigbasket/bbinstant/core/payments/entity/PaymentEntity;->isWalletEnable()Z
+move-result v6
+iput-boolean v6, v5, Lcom/bigbasket/bbinstant/core/payments/newiml/g;->d:Z
+
+# After:
+invoke-virtual/range {p1 .. p1}, Lcom/bigbasket/bbinstant/core/payments/entity/PaymentEntity;->isWalletEnable()Z
+move-result v6
+const/4 v6, 0x1    # Patched: force walletEnabled = true
+iput-boolean v6, v5, Lcom/bigbasket/bbinstant/core/payments/newiml/g;->d:Z
+```
+
+---
+
+## Data Flow (After All Patches v1+v2+v3)
 
 ```
 Server API (kwik24/v3/payment/balance)
-  └─ returns: { balance: 25, minbalance: 30, minBalanceAvailable: false }
-                                    │                        │
-                     PATCHED → 10.0 (4a,4d)       PATCHED → true (4b)
-                                    │                        │
-              SharedPrefs ← 10 (4c) │                        │
-                    │               │                        │
-         UI checks (v1) ←──────────┘                        │
-         "balance ≤ 10?"                                    │
+  └─ returns: { balance: 25, minbalance: 30, minBalanceAvailable: false, walletEnable: false }
+                                    │                        │                       │
+                     PATCHED → 10.0 (4a,4d)       PATCHED → true (4b)    PATCHED → true (5a)
+                                    │                        │                       │
+              SharedPrefs ← 10 (4c) │                        │                       │
+                    │               │                        │                       │
+         UI checks (v1) ←──────────┘                        │                       │
+         "balance ≤ 10?"                                    │                       │
+                                                            ▼                       ▼
+                                              Checkout: g.java b() method
+                                              f6191d = true → calls super.b() (5a)
+                                                            │
                                                             ▼
                                               Checkout: c.java b() method
-                                              bVar.f6175d = true → ALLOW
-                                              (LowBalance exception unreachable)
+                                              f6175d = true → ALLOW (4b)
+                                              (LowBalance & DisabledWallet unreachable)
 ```
 
 ## Build Pipeline
@@ -116,7 +163,7 @@ Server API (kwik24/v3/payment/balance)
 | Step | Tool | Command | Output |
 |------|------|---------|--------|
 | 1 | apktool 3.0.3 | `apktool d --no-res bb.apk` | `smali_nores/` (smali + raw resources) |
-| 2 | manual | Patched 4 smali files (7 patch points) | Modified smali |
+| 2 | manual | Patched 4 smali files (8 patch points) | Modified smali |
 | 3 | apktool 3.0.3 | `apktool b smali_nores/` | `bb_nores_built.apk` (new classes.dex) |
 | 4 | PowerShell | Copy original APK, swap classes.dex | `bb_final.apk` |
 | 5 | PowerShell | Remove META-INF/ (old signatures) | Unsigned APK |
@@ -136,4 +183,6 @@ Server API (kwik24/v3/payment/balance)
 - The `min_balance_required` value was previously fetched from the server via `kwik24/v3/payment/balance` API and stored in SharedPreferences by `PaymentManager.java`
 - The first build attempt failed because apktool 3.0.3's full resource rebuild dropped 1736 obfuscated resource files; fixed by injecting only the patched DEX into the original APK
 - v1 patch alone was insufficient because the server's `minBalanceAvailable` boolean (not the integer) is what actually gates purchases in `c.java`
+- v2 patch alone was insufficient because `g.java` checks `walletEnable` *before* reaching the `minBalanceAvailable` check in `c.java`
 - `const/4` cannot address registers >v15; must use `const/16` for v17+ (fixed build error)
+- Three separate server-side gates exist: `minbalance` (threshold value), `minBalanceAvailable` (balance check), and `walletEnable` (wallet disable flag) — all three must be overridden
